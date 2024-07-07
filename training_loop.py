@@ -6,7 +6,7 @@ from crnn import CNN_BiGRU_Classifier
 import math
 from tqdm import tqdm
 import numpy as np
-from training_data import load_training_data
+from training_data import data_preproc, load_pre_data
 from sklearn.model_selection import train_test_split
 from greedy_decoder import GreedyCTCDecoder
 from utils import get_actual_transcript, get_model_savepath
@@ -17,14 +17,16 @@ import datetime
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter()
 
-device = torch.device("cuda:0")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.set_default_device(device)
+print(f"Running on {device}")
 
 labels_int = np.arange(11).tolist()
 labels = [f"{i}" for i in labels_int] # Tokens to be fed into greedy decoder
 greedy_decoder = GreedyCTCDecoder(labels=labels)
 
 model_save_path = get_model_savepath()
-model_save_iterations = 20
+model_save_iterations = 200
 
 # Model Parameters
 input_size = 1  # Number of input channels
@@ -35,11 +37,17 @@ dropout_rate = 0.2
 
 # Model Definition
 model = CNN_BiGRU_Classifier(input_size, hidden_size, num_layers, output_size, dropout_rate)
+model = model.to(device)
+
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 ctc_loss = nn.CTCLoss()
 
-torch.set_default_device(device)
-X, y = load_training_data()
+presaved = True
+
+if presaved:
+    X, y = load_pre_data()
+else:
+    X,y = data_preproc()
 
 # Creating Train, Test, Validation sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -61,48 +69,14 @@ for epoch in range(epochs):
     model.train()
     for i in tqdm(range(len(X_train))):
 
-        training_sequence, target_sequence = X_train[i], torch.tensor(y_train[i]).to(device)
-
-        sequence_length = len(training_sequence)
-        
-        n_samples = math.ceil(sequence_length/step_sequence) # Since we send the last one even if it is small as can be
-
-        seq_model_output = torch.zeros(n_samples, n_classes+1) # To include the blank token
-
-        ptr = 0
-        counter = 0
-        sequences = torch.zeros([n_samples, 1, length_per_sample])
-        while ptr <= sequence_length:
-            
-            try:
-                if ptr + length_per_sample > sequence_length:
-                    sequence_chop = training_sequence[ptr:-1] # For when the window has crossed the end
-                    pad = np.zeros(length_per_sample - (sequence_length-ptr) + 1)
-                    sequence_chop = np.concatenate((sequence_chop, pad)).tolist()
-                else:
-                    sequence_chop = training_sequence[ptr:ptr+length_per_sample]
-                
-                sequence_chop = torch.tensor(sequence_chop, dtype=torch.float32).view(1, len(sequence_chop))
-
-                sequences[counter] = sequence_chop
-            
-            except Exception as e:
-                print(e)
-            
-            ptr += step_sequence
-            counter+=1
-                
-       
-        model.to(device)
+        training_sequence, target_sequence = X_train[i].to(device), torch.tensor(y_train[i]).to(device)
 
         # Zero out the gradients
         optimizer.zero_grad()
             
-        model_output_timestep = model(sequences) # Getting model output
+        model_output_timestep = model(training_sequence) # Getting model output
 
-        counter += 1
-
-        input_lengths = torch.tensor(n_samples)
+        input_lengths = torch.tensor(X_train[i].shape[0])
         target_lengths = torch.tensor(len(target_sequence))
 
         loss = ctc_loss(model_output_timestep, target_sequence, input_lengths, target_lengths)
@@ -139,6 +113,7 @@ for epoch in range(epochs):
 
     
     ################## Validation Loop ####################
+    
     model.eval()
     val_loss = 0.0
     correct = 0
@@ -146,56 +121,23 @@ for epoch in range(epochs):
     with torch.no_grad():
         for i in tqdm(range(len(X_val))):
 
-            training_sequence, target_sequence = X_val[i], torch.tensor(y_val[i]).to(device)
+            validation_sequence, target_sequence = torch.tensor(X_val[i]).to(device), torch.tensor(y_val[i]).to(device)
 
-            sequence_length = len(training_sequence)
-            
-            n_samples = math.ceil(sequence_length/step_sequence) # Since we send the last one even if it is small as can be
+            model_output_timestep = model(validation_sequence) # Getting model output
 
-            seq_model_output = torch.zeros(n_samples, n_classes+1) # To include the blank token
-
-            ptr = 0
-            counter = 0
-            sequences = torch.zeros([n_samples, 1, length_per_sample])
-            while ptr <= sequence_length:
-                
-                try:
-                    if ptr + length_per_sample > sequence_length:
-                        sequence_chop = training_sequence[ptr:-1] # For when the window has crossed the end
-                        pad = np.zeros(length_per_sample - (sequence_length-ptr) + 1)
-                        sequence_chop = np.concatenate((sequence_chop, pad)).tolist()
-                    else:
-                        sequence_chop = training_sequence[ptr:ptr+length_per_sample]
-                    
-                    sequence_chop = torch.tensor(sequence_chop, dtype=torch.float32).view(1, len(sequence_chop))
-
-                    sequences[counter] = sequence_chop
-                
-                except Exception as e:
-                    print(e)
-                
-                ptr += step_sequence
-                counter+=1
-                    
-        
-            model.to(device)
-
-            # Zero out the gradients
-            optimizer.zero_grad()
-                
-            model_output_timestep = model(sequences) # Getting model output
-
-            counter += 1
-
-            input_lengths = torch.tensor(n_samples)
+            input_lengths = torch.tensor(X_val[i].shape[0])
             target_lengths = torch.tensor(len(target_sequence))
 
             loss = ctc_loss(model_output_timestep, target_sequence, input_lengths, target_lengths)
 
+            greedy_result = greedy_decoder(model_output_timestep)
+            greedy_transcript = " ".join(greedy_result)
+            actual_transcript = get_actual_transcript(target_sequence)
+            
             if greedy_transcript == actual_transcript:
                 correct += 1
 
-            total += 1  
+            total += 1
             val_loss += loss.item()
 
     val_loss /= len(X_val)
